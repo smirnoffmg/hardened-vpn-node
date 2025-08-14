@@ -28,3 +28,13 @@ Thumbs.db
 # Build artifacts
 *.exe
 *.bin
+
+# Security reports
+*-report.json
+gosec-*.json
+trivy-*.json
+
+# Go build artifacts
+*.o
+*.a
+*.so

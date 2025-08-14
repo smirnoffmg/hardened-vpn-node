@@ -29,9 +29,9 @@
             "settings": {
                 "clients": [
                     {
-                        "id": "a6536f0d-5663-4906-b75d-1861775782b1",
+                        "id": "${XRAY_CLIENT_UUID}",
                         "level": 0,
-                        "email": "test@example.com",
+                        "email": "${XRAY_CLIENT_EMAIL}",
                         "flow": "xtls-rprx-vision"
                     }
                 ],

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,43 +17,96 @@ import (
 	"time"
 )
 
+// Configuration holds application configuration from environment variables
+type Configuration struct {
+	XrayBin         string
+	XrayConfig      string
+	HealthAddr      string
+	XrayMgmtSocket  string
+	ConnectTimeout  time.Duration
+	GracePeriod     time.Duration
+	ShutdownTimeout time.Duration
+	ClientUUID      string
+	ClientEmail     string
+}
+
+// Default configuration values
 const (
-	xrayBin        = "/usr/local/bin/xray"
-	xrayConfig     = "/etc/xray/config.json"
-	healthAddr     = ":8080"
-	xrayMgmtSocket = "127.0.0.1:10085"
-	connectTimeout = 2 * time.Second
-	gracePeriod    = 12 * time.Second
-	forceKillAfter = 5 * time.Second
+	defaultXrayBin         = "/usr/local/bin/xray"
+	defaultXrayConfig      = "/etc/xray/config.json"
+	defaultHealthAddr      = ":8080"
+	defaultXrayMgmtSocket  = "127.0.0.1:10085"
+	defaultConnectTimeout  = 2 * time.Second
+	defaultGracePeriod     = 12 * time.Second
+	defaultShutdownTimeout = 5 * time.Second
+	defaultClientUUID      = "00000000-0000-0000-0000-000000000000"
+	defaultClientEmail     = "default@example.com"
 )
 
-// User represents a VLESS user
-type User struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Level int    `json:"level"`
-	Flow  string `json:"flow"`
+// loadConfiguration loads configuration from environment variables with defaults
+func loadConfiguration() *Configuration {
+	config := &Configuration{
+		XrayBin:         getEnvOrDefault("XRAY_BIN", defaultXrayBin),
+		XrayConfig:      getEnvOrDefault("XRAY_CONFIG", defaultXrayConfig),
+		HealthAddr:      getEnvOrDefault("HEALTH_ADDR", defaultHealthAddr),
+		XrayMgmtSocket:  getEnvOrDefault("XRAY_MGMT_SOCKET", defaultXrayMgmtSocket),
+		ConnectTimeout:  parseDurationOrDefault("CONNECT_TIMEOUT", defaultConnectTimeout),
+		GracePeriod:     parseDurationOrDefault("GRACE_PERIOD", defaultGracePeriod),
+		ShutdownTimeout: parseDurationOrDefault("SHUTDOWN_TIMEOUT", defaultShutdownTimeout),
+		ClientUUID:      getEnvOrDefault("XRAY_CLIENT_UUID", defaultClientUUID),
+		ClientEmail:     getEnvOrDefault("XRAY_CLIENT_EMAIL", defaultClientEmail),
+	}
+
+	log.Printf("Configuration loaded: XrayBin=%s, HealthAddr=%s, MgmtSocket=%s",
+		config.XrayBin, config.HealthAddr, config.XrayMgmtSocket)
+
+	return config
 }
 
-// TrafficStats represents user traffic statistics
-type TrafficStats struct {
-	UserID   string `json:"user_id"`
-	Email    string `json:"email"`
-	Uplink   int64  `json:"uplink"`
-	Downlink int64  `json:"downlink"`
-	Total    int64  `json:"total"`
-	LastSeen string `json:"last_seen"`
+// processConfigTemplate processes the config template with environment variables
+func processConfigTemplate(config *Configuration) error {
+	configPath := config.XrayConfig
+
+	// Read config file
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Printf("Warning: Could not read config file %s: %v", configPath, err)
+		return nil // Not critical, use existing config
+	}
+
+	// Replace placeholders
+	processedConfig := string(configData)
+	processedConfig = strings.ReplaceAll(processedConfig, "${XRAY_CLIENT_UUID}", config.ClientUUID)
+	processedConfig = strings.ReplaceAll(processedConfig, "${XRAY_CLIENT_EMAIL}", config.ClientEmail)
+
+	// Try to write processed config back, but don't fail if filesystem is read-only
+	if err := os.WriteFile(configPath, []byte(processedConfig), 0600); err != nil {
+		log.Printf("Warning: Could not write processed config (filesystem may be read-only): %v", err)
+		// Don't return error, just log warning and continue with original config
+		return nil
+	}
+
+	log.Printf("Config processed and updated at %s", configPath)
+	return nil
 }
 
-// Quota represents user quota limits
-type Quota struct {
-	UserID       string `json:"user_id"`
-	Email        string `json:"email"`
-	DailyLimit   int64  `json:"daily_limit"`   // in bytes
-	MonthlyLimit int64  `json:"monthly_limit"` // in bytes
-	UsedToday    int64  `json:"used_today"`
-	UsedMonth    int64  `json:"used_month"`
-	ResetTime    string `json:"reset_time"`
+// getEnvOrDefault gets environment variable value or returns default
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// parseDurationOrDefault parses duration from environment or returns default
+func parseDurationOrDefault(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+		log.Printf("Warning: invalid duration format for %s, using default", key)
+	}
+	return defaultValue
 }
 
 // APIResponse represents a standard API response
@@ -63,621 +117,350 @@ type APIResponse struct {
 	Error   string      `json:"error,omitempty"`
 }
 
-// Global state for user management
-var (
-	users    = make(map[string]*User)
-	quotas   = make(map[string]*Quota)
-	stats    = make(map[string]*TrafficStats)
-	statsMux sync.RWMutex
-	quotaMux sync.RWMutex
-)
+// RateLimiter implements a simple rate limiter
+type RateLimiter struct {
+	requests map[string][]time.Time
+	mutex    sync.RWMutex
+	limit    int
+	window   time.Duration
+}
 
-func main() {
-	// Ensure xray binary exists
-	if _, err := os.Stat(xrayBin); err != nil {
-		log.Fatalf("xray binary missing: %v", err)
+// NewRateLimiter creates a new rate limiter
+func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	return &RateLimiter{
+		requests: make(map[string][]time.Time),
+		limit:    limit,
+		window:   window,
+	}
+}
+
+// Allow checks if a request from the given IP is allowed
+func (rl *RateLimiter) Allow(ip string) bool {
+	rl.mutex.Lock()
+	defer rl.mutex.Unlock()
+
+	now := time.Now()
+	windowStart := now.Add(-rl.window)
+
+	// Clean old requests
+	if requests, exists := rl.requests[ip]; exists {
+		var validRequests []time.Time
+		for _, reqTime := range requests {
+			if reqTime.After(windowStart) {
+				validRequests = append(validRequests, reqTime)
+			}
+		}
+		rl.requests[ip] = validRequests
 	}
 
-	// Initialize default users from config
-	initializeUsers()
+	// Check if limit exceeded
+	if len(rl.requests[ip]) >= rl.limit {
+		return false
+	}
 
-	// Start API server
-	mux := http.NewServeMux()
+	// Add current request
+	rl.requests[ip] = append(rl.requests[ip], now)
+	return true
+}
 
-	// Health endpoint
-	mux.HandleFunc("/", healthHandler)
+// getClientIP extracts the real client IP from the request
+func getClientIP(r *http.Request) string {
+	// Check for forwarded headers first
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		return ip
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
+	}
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
 
-	// User management endpoints
-	mux.HandleFunc("/api/users", usersHandler)
-	mux.HandleFunc("/api/users/", userHandler)
+	// Fall back to remote address
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
 
-	// Traffic statistics endpoints
-	mux.HandleFunc("/api/stats", statsHandler)
-	mux.HandleFunc("/api/stats/", userStatsHandler)
+// HealthChecker handles health check operations
+type HealthChecker struct {
+	mgmtSocket string
+	timeout    time.Duration
+}
 
-	// Quota management endpoints
-	mux.HandleFunc("/api/quotas", quotasHandler)
-	mux.HandleFunc("/api/quotas/", quotaHandler)
+// NewHealthChecker creates a new health checker instance
+func NewHealthChecker(mgmtSocket string, timeout time.Duration) *HealthChecker {
+	return &HealthChecker{
+		mgmtSocket: mgmtSocket,
+		timeout:    timeout,
+	}
+}
 
-	// System endpoints
-	mux.HandleFunc("/api/system", systemHandler)
-	mux.HandleFunc("/api/reload", reloadHandler)
+// Check performs a health check by connecting to the Xray management socket
+func (h *HealthChecker) Check() error {
+	d := net.Dialer{Timeout: h.timeout}
+	conn, err := d.Dial("tcp", h.mgmtSocket)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
 
-	srv := &http.Server{Addr: healthAddr, Handler: mux}
-	go func() {
-		log.Printf("API server starting on %s", healthAddr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("API server: %v", err)
-		}
-	}()
+// ProcessManager handles Xray process lifecycle
+type ProcessManager struct {
+	cmd         *exec.Cmd
+	gracePeriod time.Duration
+}
 
-	// Start background tasks
-	go statsCollector()
-	go quotaEnforcer()
-
-	// Build xray command
-	cmd := exec.Command(xrayBin, "-config", xrayConfig)
+// NewProcessManager creates a new process manager instance
+func NewProcessManager(binPath, configPath string) *ProcessManager {
+	cmd := exec.Command(binPath, "-config", configPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 
-	// Start xray
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start xray: %v", err)
-	}
-	log.Printf("started xray (pid=%d)", cmd.Process.Pid)
-
-	// Signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	for {
-		select {
-		case sig := <-sigCh:
-			log.Printf("received signal: %v", sig)
-			switch sig {
-			case syscall.SIGHUP:
-				log.Println("SIGHUP received: reloading configuration")
-				reloadConfiguration()
-			default:
-				log.Printf("forwarding %v to xray process", sig)
-				_ = cmd.Process.Signal(sig)
-				// Wait gracePeriod for graceful stop
-				select {
-				case <-time.After(gracePeriod):
-					log.Printf("grace period expired; killing xray")
-					_ = cmd.Process.Kill()
-				case err := <-done:
-					log.Printf("xray exited gracefully: %v", err)
-				}
-				// Shutdown API server
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = srv.Shutdown(ctx)
-				cancel()
-				os.Exit(0)
-			}
-		case err := <-done:
-			if err != nil {
-				log.Printf("xray process exited with error: %v", err)
-				os.Exit(1)
-			}
-			log.Println("xray process exited cleanly")
-			// Shutdown API server and exit
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = srv.Shutdown(ctx)
-			cancel()
-			os.Exit(0)
-		}
+	return &ProcessManager{
+		cmd:         cmd,
+		gracePeriod: defaultGracePeriod, // Will be updated by config
 	}
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+// SetGracePeriod sets the grace period for shutdown
+func (pm *ProcessManager) SetGracePeriod(period time.Duration) {
+	pm.gracePeriod = period
+}
+
+// Start starts the Xray process
+func (pm *ProcessManager) Start() error {
+	if err := pm.cmd.Start(); err != nil {
+		return err
+	}
+	log.Printf("started xray (pid=%d)", pm.cmd.Process.Pid)
+	return nil
+}
+
+// Wait waits for the process to complete
+func (pm *ProcessManager) Wait() error {
+	return pm.cmd.Wait()
+}
+
+// Signal sends a signal to the process
+func (pm *ProcessManager) Signal(sig os.Signal) error {
+	return pm.cmd.Process.Signal(sig)
+}
+
+// Kill forcefully kills the process
+func (pm *ProcessManager) Kill() error {
+	return pm.cmd.Process.Kill()
+}
+
+// GracefulShutdown attempts graceful shutdown with timeout
+func (pm *ProcessManager) GracefulShutdown() error {
+	done := make(chan error, 1)
+	go func() {
+		done <- pm.Wait()
+	}()
+
+	select {
+	case <-time.After(pm.gracePeriod):
+		log.Printf("grace period expired; killing xray")
+		return pm.Kill()
+	case err := <-done:
+		log.Printf("xray exited gracefully: %v", err)
+		return err
+	}
+}
+
+// ServerManager handles HTTP server lifecycle
+type ServerManager struct {
+	server *http.Server
+}
+
+// NewServerManager creates a new server manager instance
+func NewServerManager(addr string, handler http.Handler) *ServerManager {
+	return &ServerManager{
+		server: &http.Server{
+			Addr:              addr,
+			Handler:           handler,
+			ReadHeaderTimeout: 30 * time.Second, // Prevent Slowloris attacks
+		},
+	}
+}
+
+// Start starts the HTTP server in a goroutine
+func (sm *ServerManager) Start() {
+	go func() {
+		log.Printf("API server starting on %s", sm.server.Addr)
+		if err := sm.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("API server: %v", err)
+		}
+	}()
+}
+
+// Shutdown gracefully shuts down the server
+func (sm *ServerManager) Shutdown(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return sm.server.Shutdown(ctx)
+}
+
+// HealthHandler handles health check requests
+type HealthHandler struct {
+	healthChecker *HealthChecker
+	config        *Configuration
+	rateLimiter   *RateLimiter
+}
+
+// NewHealthHandler creates a new health handler
+func NewHealthHandler(hc *HealthChecker, config *Configuration) *HealthHandler {
+	return &HealthHandler{
+		healthChecker: hc,
+		config:        config,
+		rateLimiter:   NewRateLimiter(10, time.Minute), // 10 requests per minute per IP
+	}
+}
+
+// ServeHTTP implements http.Handler interface
+func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Add security headers
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+
+	// Rate limiting
+	clientIP := getClientIP(r)
+	if !h.rateLimiter.Allow(clientIP) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 
-	// Fast TCP connect to the mgmt API (local only)
-	d := net.Dialer{Timeout: connectTimeout}
-	conn, err := d.Dial("tcp", xrayMgmtSocket)
-	if err != nil {
+	if err := h.healthChecker.Check(); err != nil {
 		http.Error(w, "xray-api-unreachable", http.StatusServiceUnavailable)
 		return
 	}
-	_ = conn.Close()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	response := APIResponse{
+	h.writeResponse(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "ok",
 		Data: map[string]interface{}{
 			"status":    "healthy",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
-			"uptime":    getUptime(),
 		},
-	}
-	json.NewEncoder(w).Encode(response)
+	})
 }
 
-func usersHandler(w http.ResponseWriter, r *http.Request) {
+// writeResponse writes a JSON response
+func (h *HealthHandler) writeResponse(w http.ResponseWriter, statusCode int, response APIResponse) {
 	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case "GET":
-		statsMux.RLock()
-		userList := make([]*User, 0, len(users))
-		for _, user := range users {
-			userList = append(userList, user)
-		}
-		statsMux.RUnlock()
-
-		response := APIResponse{
-			Success: true,
-			Data:    userList,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	case "POST":
-		var user User
-		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		if user.ID == "" {
-			http.Error(w, "User ID is required", http.StatusBadRequest)
-			return
-		}
-
-		statsMux.Lock()
-		users[user.ID] = &user
-		statsMux.Unlock()
-
-		// Initialize quota for new user
-		quotaMux.Lock()
-		quotas[user.ID] = &Quota{
-			UserID:       user.ID,
-			Email:        user.Email,
-			DailyLimit:   10 * 1024 * 1024 * 1024,  // 10GB default
-			MonthlyLimit: 100 * 1024 * 1024 * 1024, // 100GB default
-			ResetTime:    time.Now().UTC().Format(time.RFC3339),
-		}
-		quotaMux.Unlock()
-
-		response := APIResponse{
-			Success: true,
-			Message: "User created successfully",
-			Data:    user,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode JSON response: %v", err)
+		// Don't write another header as it's already been written
 	}
 }
 
-func userHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
+func main() {
+	// Load configuration from environment
+	config := loadConfiguration()
+
+	// Validate prerequisites
+	if err := validatePrerequisites(config); err != nil {
+		log.Fatalf("prerequisites validation failed: %v", err)
 	}
-	userID := parts[3]
 
-	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case "GET":
-		statsMux.RLock()
-		user, exists := users[userID]
-		statsMux.RUnlock()
-
-		if !exists {
-			http.Error(w, "User not found", http.StatusNotFound)
-			return
-		}
-
-		response := APIResponse{
-			Success: true,
-			Data:    user,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	case "PUT":
-		var user User
-		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		statsMux.Lock()
-		if _, exists := users[userID]; !exists {
-			statsMux.Unlock()
-			http.Error(w, "User not found", http.StatusNotFound)
-			return
-		}
-		user.ID = userID // Ensure ID matches
-		users[userID] = &user
-		statsMux.Unlock()
-
-		response := APIResponse{
-			Success: true,
-			Message: "User updated successfully",
-			Data:    user,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	case "DELETE":
-		statsMux.Lock()
-		if _, exists := users[userID]; !exists {
-			statsMux.Unlock()
-			http.Error(w, "User not found", http.StatusNotFound)
-			return
-		}
-		delete(users, userID)
-		statsMux.Unlock()
-
-		quotaMux.Lock()
-		delete(quotas, userID)
-		quotaMux.Unlock()
-
-		response := APIResponse{
-			Success: true,
-			Message: "User deleted successfully",
-		}
-		json.NewEncoder(w).Encode(response)
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	// Process config template if available (skip if read-only filesystem)
+	if err := processConfigTemplate(config); err != nil {
+		log.Printf("Warning: config template processing failed: %v", err)
+		// Continue with original config if template processing fails
 	}
+
+	// Initialize components
+	healthChecker := NewHealthChecker(config.XrayMgmtSocket, config.ConnectTimeout)
+	processManager := NewProcessManager(config.XrayBin, config.XrayConfig)
+	processManager.SetGracePeriod(config.GracePeriod)
+	healthHandler := NewHealthHandler(healthChecker, config)
+	serverManager := NewServerManager(config.HealthAddr, healthHandler)
+
+	// Start services
+	serverManager.Start()
+	if err := processManager.Start(); err != nil {
+		log.Fatalf("failed to start xray: %v", err)
+	}
+
+	// Setup signal handling
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	// Main event loop
+	runEventLoop(sigCh, processManager, serverManager, config)
 }
 
-func statsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+// validatePrerequisites checks if required files exist
+func validatePrerequisites(config *Configuration) error {
+	if _, err := os.Stat(config.XrayBin); err != nil {
+		return fmt.Errorf("xray binary not found at %s: %v", config.XrayBin, err)
 	}
-
-	statsMux.RLock()
-	statsList := make([]*TrafficStats, 0, len(stats))
-	for _, stat := range stats {
-		statsList = append(statsList, stat)
-	}
-	statsMux.RUnlock()
-
-	response := APIResponse{
-		Success: true,
-		Data:    statsList,
-	}
-	json.NewEncoder(w).Encode(response)
+	return nil
 }
 
-func userStatsHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-	userID := parts[3]
-
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	statsMux.RLock()
-	stat, exists := stats[userID]
-	statsMux.RUnlock()
-
-	if !exists {
-		http.Error(w, "Stats not found", http.StatusNotFound)
-		return
-	}
-
-	response := APIResponse{
-		Success: true,
-		Data:    stat,
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-func quotasHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case "GET":
-		quotaMux.RLock()
-		quotaList := make([]*Quota, 0, len(quotas))
-		for _, quota := range quotas {
-			quotaList = append(quotaList, quota)
-		}
-		quotaMux.RUnlock()
-
-		response := APIResponse{
-			Success: true,
-			Data:    quotaList,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	case "POST":
-		var quota Quota
-		if err := json.NewDecoder(r.Body).Decode(&quota); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		if quota.UserID == "" {
-			http.Error(w, "User ID is required", http.StatusBadRequest)
-			return
-		}
-
-		quotaMux.Lock()
-		quotas[quota.UserID] = &quota
-		quotaMux.Unlock()
-
-		response := APIResponse{
-			Success: true,
-			Message: "Quota created successfully",
-			Data:    quota,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func quotaHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) < 4 {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-	userID := parts[3]
-
-	w.Header().Set("Content-Type", "application/json")
-
-	switch r.Method {
-	case "GET":
-		quotaMux.RLock()
-		quota, exists := quotas[userID]
-		quotaMux.RUnlock()
-
-		if !exists {
-			http.Error(w, "Quota not found", http.StatusNotFound)
-			return
-		}
-
-		response := APIResponse{
-			Success: true,
-			Data:    quota,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	case "PUT":
-		var quota Quota
-		if err := json.NewDecoder(r.Body).Decode(&quota); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		quotaMux.Lock()
-		if _, exists := quotas[userID]; !exists {
-			quotaMux.Unlock()
-			http.Error(w, "Quota not found", http.StatusNotFound)
-			return
-		}
-		quota.UserID = userID // Ensure ID matches
-		quotas[userID] = &quota
-		quotaMux.Unlock()
-
-		response := APIResponse{
-			Success: true,
-			Message: "Quota updated successfully",
-			Data:    quota,
-		}
-		json.NewEncoder(w).Encode(response)
-
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func systemHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	systemInfo := map[string]interface{}{
-		"uptime":        getUptime(),
-		"users":         len(users),
-		"active_users":  getActiveUsers(),
-		"total_traffic": getTotalTraffic(),
-		"memory_usage":  getMemoryUsage(),
-		"timestamp":     time.Now().UTC().Format(time.RFC3339),
-	}
-
-	response := APIResponse{
-		Success: true,
-		Data:    systemInfo,
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-func reloadHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	go reloadConfiguration()
-
-	response := APIResponse{
-		Success: true,
-		Message: "Configuration reload initiated",
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-// Helper functions
-
-func initializeUsers() {
-	// Initialize with default user from config
-	defaultUser := &User{
-		ID:    "a6536f0d-5663-4906-b75d-1861775782b1",
-		Email: "test@example.com",
-		Level: 0,
-		Flow:  "xtls-rprx-vision",
-	}
-	users[defaultUser.ID] = defaultUser
-
-	// Initialize quota for default user
-	quotas[defaultUser.ID] = &Quota{
-		UserID:       defaultUser.ID,
-		Email:        defaultUser.Email,
-		DailyLimit:   10 * 1024 * 1024 * 1024,  // 10GB
-		MonthlyLimit: 100 * 1024 * 1024 * 1024, // 100GB
-		ResetTime:    time.Now().UTC().Format(time.RFC3339),
-	}
-
-	log.Printf("Initialized %d users", len(users))
-}
-
-func statsCollector() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// runEventLoop handles the main event loop
+func runEventLoop(sigCh <-chan os.Signal, pm *ProcessManager, sm *ServerManager, config *Configuration) {
+	done := make(chan error, 1)
+	go func() {
+		done <- pm.Wait()
+	}()
 
 	for {
 		select {
-		case <-ticker.C:
-			collectStats()
+		case sig := <-sigCh:
+			handleSignal(sig, pm, sm, config)
+		case err := <-done:
+			handleProcessExit(err, sm, config)
 		}
 	}
 }
 
-func collectStats() {
-	// Simulate collecting stats from Xray API
-	// In a real implementation, this would query the Xray API
-	statsMux.Lock()
-	defer statsMux.Unlock()
-
-	for userID, user := range users {
-		if _, exists := stats[userID]; !exists {
-			stats[userID] = &TrafficStats{
-				UserID:   userID,
-				Email:    user.Email,
-				LastSeen: time.Now().UTC().Format(time.RFC3339),
-			}
-		}
-
-		// Simulate traffic data (in real implementation, get from Xray)
-		stats[userID].Uplink += int64(time.Now().Unix() % 1000)
-		stats[userID].Downlink += int64(time.Now().Unix() % 2000)
-		stats[userID].Total = stats[userID].Uplink + stats[userID].Downlink
-		stats[userID].LastSeen = time.Now().UTC().Format(time.RFC3339)
-	}
-}
-
-func quotaEnforcer() {
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			enforceQuotas()
-		}
-	}
-}
-
-func enforceQuotas() {
-	quotaMux.Lock()
-	defer quotaMux.Unlock()
-
-	now := time.Now()
-
-	for userID, quota := range quotas {
-		// Check daily quota
-		if quota.UsedToday >= quota.DailyLimit {
-			log.Printf("User %s has exceeded daily quota", userID)
-			// In a real implementation, this would disable the user
-		}
-
-		// Check monthly quota
-		if quota.UsedMonth >= quota.MonthlyLimit {
-			log.Printf("User %s has exceeded monthly quota", userID)
-			// In a real implementation, this would disable the user
-		}
-
-		// Reset daily quota at midnight
-		resetTime, _ := time.Parse(time.RFC3339, quota.ResetTime)
-		if now.Sub(resetTime) >= 24*time.Hour {
-			quota.UsedToday = 0
-			quota.ResetTime = now.UTC().Format(time.RFC3339)
-		}
-	}
-}
-
-func reloadConfiguration() {
-	log.Println("Reloading Xray configuration...")
-	// In a real implementation, this would reload the Xray config
-	// For now, just log the action
-}
-
-func getUptime() string {
-	// In a real implementation, this would calculate actual uptime
-	return "1h 23m 45s"
-}
-
-func getActiveUsers() int {
-	statsMux.RLock()
-	defer statsMux.RUnlock()
-
-	active := 0
-	now := time.Now()
-
-	for _, stat := range stats {
-		lastSeen, err := time.Parse(time.RFC3339, stat.LastSeen)
-		if err == nil && now.Sub(lastSeen) < 5*time.Minute {
-			active++
-		}
+// handleSignal processes system signals
+func handleSignal(sig os.Signal, pm *ProcessManager, sm *ServerManager, config *Configuration) {
+	if sig == syscall.SIGHUP {
+		log.Println("SIGHUP received: configuration reload not implemented")
+		return
 	}
 
-	return active
-}
-
-func getTotalTraffic() int64 {
-	statsMux.RLock()
-	defer statsMux.RUnlock()
-
-	total := int64(0)
-	for _, stat := range stats {
-		total += stat.Total
+	log.Printf("forwarding %v to xray process", sig)
+	if err := pm.Signal(sig); err != nil {
+		log.Printf("failed to signal xray: %v", err)
+		return
 	}
 
-	return total
+	if err := pm.GracefulShutdown(); err != nil {
+		log.Printf("failed to shutdown xray gracefully: %v", err)
+	}
+
+	if err := sm.Shutdown(config.ShutdownTimeout); err != nil {
+		log.Printf("failed to shutdown server: %v", err)
+	}
+	os.Exit(0)
 }
 
-func getMemoryUsage() map[string]interface{} {
-	// In a real implementation, this would get actual memory usage
-	return map[string]interface{}{
-		"used":       "128MB",
-		"total":      "512MB",
-		"percentage": 25,
+// handleProcessExit handles process exit events
+func handleProcessExit(err error, sm *ServerManager, config *Configuration) {
+	if err != nil {
+		log.Printf("xray process exited with error: %v", err)
+		os.Exit(1)
 	}
+
+	log.Println("xray process exited cleanly")
+	if err := sm.Shutdown(config.ShutdownTimeout); err != nil {
+		log.Printf("failed to shutdown server: %v", err)
+	}
+	os.Exit(0)
 }

@@ -34,7 +34,7 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # build tiny static entrypoint binary (supervisor + health)
 # -----------------------------------------------------------------------------
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 RUN apk add --no-cache git build-base
 WORKDIR /src
 COPY entrypoint.go .
@@ -56,18 +56,27 @@ COPY --from=fetch /tmp/xray-x /usr/local/bin/xray
 COPY --from=builder /out/entrypoint /usr/local/bin/entrypoint
 
 # default config shipped as example; in production mount /etc/xray/config.json:ro
-COPY config.json /etc/xray/config.json
+COPY config/config.json /etc/xray/config.json
+
+# Security: Create necessary directories (distroless handles permissions)
+# The distroless nonroot user (65532) will have appropriate permissions
 
 # runtime file locations; /var/log needs to be writable by the runtime user
 # distroless nonroot contains uid 65532; we rely on host mounts for logs or create tmp volumes at runtime.
 # Expose health port (unprivileged) and application port for passthrough (container ports are informational)
 EXPOSE 8080 443
 
+# Security: Add healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/entrypoint", "--health-check"]
+
 # Metadata & labels (helpful for scanning & provenance)
 LABEL org.opencontainers.image.title="xray-node" \
     org.opencontainers.image.description="Hardened Xray VLESS node (non-root, minimal image)" \
     org.opencontainers.image.version="${XRAY_VERSION}" \
-    org.opencontainers.image.licenses="MIT"
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.source="https://github.com/your-repo/xray-node" \
+    org.opencontainers.image.revision="${XRAY_VERSION}"
 
 # Runtime entrypoint
 ENTRYPOINT ["/usr/local/bin/entrypoint"]
