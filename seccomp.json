@@ -1,0 +1,100 @@
+{
+    "defaultAction": "SCMP_ACT_ERRNO",
+    "archMap": [
+        {
+            "architecture": "SCMP_ARCH_X86_64",
+            "subarchitectures": [
+                "SCMP_ARCH_X86",
+                "SCMP_ARCH_X32"
+            ]
+        }
+    ],
+    "syscalls": [
+        {
+            "names": [
+                "read",
+                "write",
+                "exit",
+                "exit_group",
+                "rt_sigreturn",
+                "sigreturn",
+                "rt_sigaction",
+                "rt_sigprocmask",
+                "rt_sigsuspend",
+                "nanosleep",
+                "clock_gettime",
+                "clock_getres",
+                "getpid",
+                "gettid",
+                "getppid",
+                "futex",
+                "set_tid_address",
+                "set_robust_list",
+                "prlimit64",
+                "pread64",
+                "pwrite64",
+                "lseek",
+                "close",
+                "ioctl",
+                "fcntl",
+                "openat",
+                "newfstatat",
+                "stat",
+                "fstat",
+                "mmap",
+                "mprotect",
+                "munmap",
+                "brk",
+                "access",
+                "faccessat",
+                "getrandom",
+                "pipe",
+                "pipe2",
+                "dup",
+                "dup2",
+                "sendto",
+                "recvfrom",
+                "sendmsg",
+                "recvmsg",
+                "setsockopt",
+                "getsockopt",
+                "connect",
+                "accept",
+                "bind",
+                "listen",
+                "getsockname",
+                "getpeername",
+                "shutdown",
+                "socket",
+                "socketpair",
+                "clone",
+                "uname",
+                "getcwd",
+                "chdir",
+                "time",
+                "gettimeofday",
+                "settimeofday",
+                "statfs",
+                "fstatfs",
+                "splice",
+                "tee",
+                "vmsplice",
+                "epoll_create1",
+                "epoll_ctl",
+                "epoll_wait",
+                "restart_syscall"
+            ],
+            "action": "SCMP_ACT_ALLOW"
+        },
+        {
+            "names": [
+                "ptrace",
+                "kexec_load",
+                "init_module",
+                "finit_module",
+                "delete_module"
+            ],
+            "action": "SCMP_ACT_ERRNO"
+        }
+    ]
+}

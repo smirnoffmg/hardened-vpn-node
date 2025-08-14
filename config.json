@@ -1,0 +1,75 @@
+{
+    "log": {
+        "access": "/var/log/xray/access.log",
+        "error": "/var/log/xray/error.log",
+        "loglevel": "warning"
+    },
+    "api": {
+        "tag": "api",
+        "services": [
+            "HandlerService",
+            "StatsService",
+            "LoggerService"
+        ]
+    },
+    "inbounds": [
+        {
+            "tag": "api-in",
+            "listen": "127.0.0.1",
+            "port": 10085,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "127.0.0.1"
+            }
+        },
+        {
+            "tag": "vless-tls",
+            "port": 443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "a6536f0d-5663-4906-b75d-1861775782b1",
+                        "level": 0,
+                        "email": "test@example.com",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": [
+                        "h2",
+                        "http/1.1"
+                    ],
+                    "certificates": [
+                        {
+                            "certificateFile": "/etc/xray/certs/certificate.crt",
+                            "keyFile": "/etc/xray/certs/private.key"
+                        }
+                    ]
+                }
+            }
+        }
+    ],
+    "routing": {
+        "rules": [
+            {
+                "type": "field",
+                "inboundTag": [
+                    "api-in"
+                ],
+                "outboundTag": "api"
+            }
+        ]
+    },
+    "outbounds": [
+        {
+            "protocol": "freedom",
+            "settings": {}
+        }
+    ]
+}

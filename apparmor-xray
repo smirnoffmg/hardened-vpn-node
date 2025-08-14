@@ -1,0 +1,17 @@
+# file: apparmor-xray
+#include <tunables/global>
+
+/usr/local/bin/entrypoint {
+  #include <abstractions/base>
+  network,
+  capability net_bind_service,
+  /usr/local/bin/xray mr,
+  /usr/local/bin/entrypoint mr,
+  /etc/xray/config.json r,
+  /etc/letsencrypt/** r,
+  /var/log/xray/** rw,
+  /tmp/** rw,
+  /proc/** r,
+  /sys/** r,
+  deny /** wklx,
+}
