@@ -1,0 +1,30 @@
+# Generated certificates and keys
+certs/
+*.crt
+*.key
+*.pem
+
+# Logs
+logs/
+*.log
+
+# Docker
+.dockerignore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+
+# Build artifacts
+*.exe
+*.bin
