@@ -48,6 +48,9 @@ RUN go build -ldflags="-s -w" -o /out/entrypoint entrypoint.go
 # -----------------------------------------------------------------------------
 FROM gcr.io/distroless/static:nonroot AS runtime
 
+# Pass ARG to runtime stage
+ARG XRAY_VERSION
+
 # create working dir structure (files copied into image already owned by nonroot)
 COPY --from=fetch /tmp/xray-x /usr/local/bin/xray
 COPY --from=builder /out/entrypoint /usr/local/bin/entrypoint
